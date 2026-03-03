@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
+using Payments.Application.Payments.CreatePayment;
 using Payments.Infrastructure.Persistence;
-using Payments.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 
 
@@ -8,9 +8,13 @@ using Microsoft.EntityFrameworkCore;
 [Route("api/[controller]")]
 public class PaymentsController : ControllerBase
 {
+    private readonly CreatePaymentHandler _createPaymentHandler;
     private readonly PaymentsDbContext _db;
-    public PaymentsController(PaymentsDbContext db)
+    
+
+    public PaymentsController(CreatePaymentHandler createPaymentHandler, PaymentsDbContext db)
     {
+        _createPaymentHandler = createPaymentHandler;
         _db = db;
     }
     [HttpPost]
@@ -19,8 +23,16 @@ public class PaymentsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> Create(
         [FromBody] CreatePaymentRequest request,
-        [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey)
+        [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
+        CancellationToken ct)
+       
     {
+        
+
+        if(request == null)
+        {
+            return BadRequest(new{error = "Request body is required"});
+        }
         if (string.IsNullOrWhiteSpace(idempotencyKey))
         {
             return BadRequest(new{error = "Idempotency-Key header is required"});
@@ -29,38 +41,32 @@ public class PaymentsController : ControllerBase
         {
             return BadRequest(new{error = "userId is required"});
         }
-         // If already created with same (userId, idempotencyKey), return it
-
-         var existingPayment = await _db.Payments
-            .FirstOrDefaultAsync(p => p.UserId == request.UserId && p.IdempotencyKey == idempotencyKey);
+        idempotencyKey = idempotencyKey.Trim();
         
-        if (existingPayment != null)        {
-            return Ok(existingPayment);
-        }
-        
-        var payment = new Payment
+        var command = new CreatePaymentCommand
         {
-            Id = Guid.NewGuid(),
             UserId = request.UserId,
-            IdempotencyKey = idempotencyKey,
             Amount = request.Amount,
-            Currency = request.Currency,
-            Status = PaymentStatus.Pending,
-            CreatedAtUtc = DateTime.UtcNow
+            Currency = string.IsNullOrWhiteSpace(request.Currency) ? "AUD" : request.Currency.Trim(),
+            IdempotencyKey = idempotencyKey
         };
-        _db.Payments.Add(payment);
-      await _db.SaveChangesAsync();
-      
-        
-        return CreatedAtAction(nameof(GetById), new { id = payment.Id }, payment);
+
+        var result = await _createPaymentHandler.Handle(command, ct);
+
+        if(result.IsReplay)
+        {
+            return Ok(new{isReplay = true, payment = result.Payment});
+        }
+        return CreatedAtAction(nameof(GetById), new { id = result.Payment.Id }, new{isReplay = false, payment = result.Payment});
     }
 
     [HttpGet("{id:guid}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> GetById(Guid id)
+    public async Task<IActionResult> GetById(Guid id, CancellationToken ct)
     {
-        var payment = await _db.Payments.FindAsync(id);
+        var payment = await _db.Payments.AsNoTracking().FirstOrDefaultAsync(p=> p.Id == id,ct);
+        
         if (payment == null)
         {
             return NotFound();
