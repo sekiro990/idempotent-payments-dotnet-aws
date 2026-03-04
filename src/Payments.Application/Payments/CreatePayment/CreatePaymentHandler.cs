@@ -1,3 +1,14 @@
+/// <summary>
+/// Handles idempotent payment creation.
+/// Flow:
+/// 1. Check Redis for cached idempotency key.
+/// 2. If found, return existing payment (replay).
+/// 3. If not found, check database.
+/// 4. Insert new payment if none exists.
+/// 5. Handle concurrent insert via unique constraint (Postgres 23505).
+/// 6. Cache the result in Redis for fast future replays.
+/// </summary>
+
 using Payments.Application.Common.Interfaces;
 using Microsoft.EntityFrameworkCore;
 using Payments.Domain.Entities;
@@ -7,10 +18,12 @@ namespace Payments.Application.Payments.CreatePayment;
 public class CreatePaymentHandler
 {
     private readonly IPaymentsDbContext _db;
+    private readonly IIdempotencyStore _idempo;
 
-    public CreatePaymentHandler(IPaymentsDbContext db)
+    public CreatePaymentHandler(IPaymentsDbContext db, IIdempotencyStore idempotencyStore)
     {
         _db = db;
+        _idempo = idempotencyStore;
     }
 
     public async Task<CreatePaymentResult> Handle(CreatePaymentCommand command, CancellationToken ct)
@@ -21,6 +34,21 @@ public class CreatePaymentHandler
         if(command.Amount <= 0) throw new ArgumentException("Amount must be greater than zero", nameof(command.Amount));
         if(string.IsNullOrWhiteSpace(command.Currency)) throw new ArgumentException("Currency is required", nameof(command.Currency));
         var key = command.IdempotencyKey.Trim();
+
+        var cachedPaymentId = await _idempo.GetPaymentIdAsync(command.UserId, key, ct);
+
+        if(cachedPaymentId.HasValue)
+        {
+            var cachedPayment = await _db.Payments.AsNoTracking().FirstOrDefaultAsync(p => p.Id == cachedPaymentId.Value, ct);
+            if(cachedPayment != null)
+            {
+                return new CreatePaymentResult
+                {
+                    IsReplay = true,
+                    Payment = cachedPayment
+                };
+            }
+        }
 
         
 
@@ -39,6 +67,7 @@ public class CreatePaymentHandler
             var payment = BuildPayment(command, key);
             try
             {
+                _idempo.SetPaymentIdAsync(command.UserId, key, payment.Id, TimeSpan.FromMinutes(15), ct).Wait(ct);
                 _db.Payments.Add(payment);
                 await _db.SaveChangesAsync(ct);
                 return new CreatePaymentResult
@@ -47,6 +76,10 @@ public class CreatePaymentHandler
                     Payment = payment
                 };
             }
+            // Postgres unique constraint violation (23505)
+            // This occurs if two concurrent requests attempt to insert
+            // the same (UserId, IdempotencyKey).
+            // In this case, we re-query and return the already-created payment.
             catch (DbUpdateException ex) when (ex.InnerException is PostgresException pgEx && pgEx.SqlState == "23505")
             {
                 var concurrentPayment = await FindByIdempotentAsync(command.UserId, key, ct);
